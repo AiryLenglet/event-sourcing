@@ -63,7 +63,9 @@ public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository
                 String snapshot = null;
                 final List<JsonNode> jsonNodePatches = new ArrayList<>();
 
+                var rowCount = 0;
                 while (resultSet.next()) {
+                    rowCount++;
                     version = resultSet.getLong("version");
                     final var type = resultSet.getString("type");
                     final var data = resultSet.getString("data");
@@ -72,6 +74,9 @@ public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository
                     } else {
                         jsonNodePatches.add(this.objectMapper.readTree(data));
                     }
+                }
+                if (rowCount == 0) {
+                    throw new NoResultException("Unable to find stream " + id);
                 }
                 connection.commit();
 
@@ -87,7 +92,7 @@ public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository
                 return new DueDiligence(id, version, data);
             }
         } catch (Exception e) {
-            if(!connection.isClosed()) {
+            if (!connection.isClosed()) {
                 connection.rollback();
             }
             throw e;

@@ -14,7 +14,7 @@ public class Main {
         final var dataSource = new HikariDataSource();
         dataSource.setUsername("sa");
         dataSource.setPassword("Password22");
-        dataSource.setJdbcUrl("jdbc:sqlserver://localhost:1433;encrypt=false");
+        dataSource.setJdbcUrl("jdbc:sqlserver://localhost:1433;encrypt=false;disableStatementPooling=true;statementPoolingCacheSize=2");
         dataSource.setAutoCommit(false);
         dataSource.setTransactionIsolation("TRANSACTION_READ_COMMITTED");
         dataSource.setMaximumPoolSize(1);

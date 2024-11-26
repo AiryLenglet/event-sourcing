@@ -50,6 +50,7 @@ public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository
                            , ancestor.data
                       FROM event_stream AS ancestor
                       JOIN stream s ON s.version = ancestor.version + 1
+                      AND ancestor.stream_id = ?
                       AND ancestor.type = 'snapshot')
                   SELECT *
                   FROM stream
@@ -57,6 +58,7 @@ public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository
                 """);
         try (connection; preparedStatement) {
             preparedStatement.setLong(1, id);
+            preparedStatement.setLong(2, id);
 
             try (final var resultSet = preparedStatement.executeQuery()) {
                 long version = 1;

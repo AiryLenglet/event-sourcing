@@ -26,6 +26,11 @@ public class ValidationDueDiligenceRepositoryProxy implements DueDiligenceReposi
         this.dueDiligenceRepository.update(dueDiligence);
     }
 
+    @Override
+    public void persist(DueDiligence dueDiligence) {
+
+    }
+
     private void validate(DueDiligence dueDiligence) {
         final var constraintViolations = this.validatorFactory.getValidator().validate(dueDiligence);
         if (constraintViolations.isEmpty()) {

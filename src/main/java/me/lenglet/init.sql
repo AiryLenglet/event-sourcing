@@ -12,5 +12,6 @@ CREATE TABLE event_stream (
   , type VARCHAR(20) NOT NULL
   , data NVARCHAR(max) NOT NULL --add JSON constraint
   , CONSTRAINT stream_id_version_unique UNIQUE(stream_id, version)
+  , FOREIGN KEY (stream_id, previous) REFERENCES (stream_id, version)
 );
 GO

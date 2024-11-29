@@ -1,154 +1,114 @@
 package me.lenglet;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.gravity9.jsonpatch.JsonPatch;
-import com.gravity9.jsonpatch.diff.JsonDiff;
 
 import javax.sql.DataSource;
-import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class MsSqlServerDueDiligenceRepository implements DueDiligenceRepository {
 
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    public static final ScopedValue<AtomicLong> CURRENT_VERSION = ScopedValue.newInstance();
+
+    private final ObjectMapper objectMapper;
     private final DataSource dataSource;
+    private final ConnectionFactory connectionFactory;
 
     public MsSqlServerDueDiligenceRepository(
-            DataSource dataSource
+            ObjectMapper objectMapper,
+            DataSource dataSource,
+            ConnectionFactory connectionFactory
     ) {
         this.dataSource = dataSource;
+        this.objectMapper = objectMapper;
+        this.connectionFactory = connectionFactory;
     }
 
     @Override
     public DueDiligence findById(long id) {
         try {
-            return this.findByIdInternal(id);
+            final var connection = this.connectionFactory.getConnection();
+            final var statement = connection.prepareStatement("""
+                    SELECT type, data
+                    FROM event_stream
+                    WHERE stream_id = ?
+                    ORDER BY version ASC
+                    """);
+            statement.setLong(1, id);
+            final var rs = statement.executeQuery();
+            final var events = new ArrayList<DueDiligenceEvent>();
+            while (rs.next()) {
+                switch (rs.getString("type")) {
+                    case "init" ->
+                            events.add(this.objectMapper.readValue(rs.getString("data"), DueDiligenceEvent.Created.class));
+                    case "patch" ->
+                            events.add(this.objectMapper.readValue(rs.getString("data"), DueDiligenceEvent.Patched.class));
+                }
+            }
+            CURRENT_VERSION.get().set(events.size());
+            return DueDiligence.from(id, events);
+
         } catch (Exception e) {
             throw new RuntimeException(e);
-        }
-    }
-
-    private DueDiligence findByIdInternal(long id) throws Exception {
-        final var connection = this.dataSource.getConnection();
-        final var preparedStatement = connection.prepareStatement("""
-                  WITH stream (version, type, data) AS (
-                      SELECT version
-                           , type
-                           , data
-                      FROM event_stream
-                      WHERE id = (SELECT TOP 1 id
-                                  FROM event_stream
-                                  WHERE stream_id = ?
-                                  ORDER BY version DESC)
-                      UNION ALL
-                      SELECT ancestor.version
-                           , ancestor.type
-                           , ancestor.data
-                      FROM event_stream AS ancestor
-                      JOIN stream s ON s.version = ancestor.version + 1
-                      AND ancestor.stream_id = ?
-                      AND ancestor.type = 'snapshot')
-                  SELECT *
-                  FROM stream
-                  ORDER BY version ASC
-                """);
-        try (connection; preparedStatement) {
-            preparedStatement.setLong(1, id);
-            preparedStatement.setLong(2, id);
-
-            try (final var resultSet = preparedStatement.executeQuery()) {
-                long version = 1;
-                String snapshot = null;
-                final List<JsonNode> jsonNodePatches = new ArrayList<>();
-
-                var rowCount = 0;
-                while (resultSet.next()) {
-                    rowCount++;
-                    version = resultSet.getLong("version");
-                    final var type = resultSet.getString("type");
-                    final var data = resultSet.getString("data");
-                    if ("snapshot".equals(type)) {
-                        snapshot = data;
-                    } else {
-                        jsonNodePatches.add(this.objectMapper.readTree(data));
-                    }
-                }
-                if (rowCount == 0) {
-                    throw new NoResultException("Unable to find stream " + id);
-                }
-                connection.commit();
-
-                if (snapshot == null) {
-                    throw new RuntimeException("Malformed stream, unable to find snapshot");
-                }
-                var jsonNodeSnapshot = this.objectMapper.readTree(snapshot);
-                for (final var jsonNodePatch : jsonNodePatches) {
-                    jsonNodeSnapshot = JsonPatch.fromJson(jsonNodePatch).apply(jsonNodeSnapshot);
-                }
-
-                final var data = this.objectMapper.treeToValue(jsonNodeSnapshot, DueDiligence.Data.class);
-                return new DueDiligence(id, version, data);
-            }
-        } catch (Exception e) {
-            if (!connection.isClosed()) {
-                connection.rollback();
-            }
-            throw e;
         }
     }
 
     @Override
     public void update(DueDiligence dueDiligence) {
+        final var currentVersion = CURRENT_VERSION.get();
         try {
-            this.updateInternal(dueDiligence);
+            final var connection = this.connectionFactory.getConnection();
+            final var statement = connection.prepareStatement("""
+                             INSERT INTO event_stream (stream_id, version, timestamp, user_id, type, data, previous)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """);
+            statement.setLong(1, dueDiligence.getId());
+            statement.setTimestamp(3, Timestamp.from(Instant.now()));
+            statement.setString(4, "user343432");
+            statement.setString(5, "patch");
+
+            dueDiligence.getEvents().stream()
+                    .skip(currentVersion.get())
+                    .forEach(event -> {
+                        try {
+                            statement.setLong(7, currentVersion.get());
+                            statement.setLong(2, currentVersion.incrementAndGet());
+                            statement.setString(6, this.objectMapper.writeValueAsString(event));
+                            statement.addBatch();
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+            statement.executeBatch();
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
 
-    private void updateInternal(DueDiligence dueDiligence) throws Exception {
-        /* adding transaction id ? */
-        final var version = (long) get("version", dueDiligence);
-        final var data = get("data", dueDiligence);
+    @Override
+    public void persist(DueDiligence dueDiligence) {
+        final var events = dueDiligence.getEvents();
+        try {
+            final var connection = this.dataSource.getConnection();
+            final var statement = connection.prepareStatement("""
+                             INSERT INTO event_stream (version, timestamp, user_id, type, data)
+                             OUTPUT INSERTED.id
+                             VALUES (?, ?, ?, ?, ?)
+                    """);
+            statement.setLong(1, 1L);
+            statement.setTimestamp(2, Timestamp.from(Instant.now()));
+            statement.setString(3, "user343432");
+            statement.setString(4, "init");
+            statement.setString(5, this.objectMapper.writeValueAsString(events.iterator().next()));
 
-        final var diff = JsonDiff.asJsonPatch((JsonNode) get("originState", dueDiligence), this.objectMapper.valueToTree(data));
-        final var jsonPatchString = this.objectMapper.writeValueAsString(diff);
+            final var rs = statement.executeQuery();
+            rs.next();
+            final var id = rs.getLong(1);
 
-        final var connection = this.dataSource.getConnection();
-        final var preparedStatement = connection.prepareStatement("""
-                INSERT INTO event_stream (version, timestamp, user_id, type, data)
-                VALUES (?, ?, ?, ?, ?)
-                """);
-        try (connection; preparedStatement) {
-
-            preparedStatement.setLong(1, dueDiligence.getId());
-            preparedStatement.setLong(2, version + 1);
-            preparedStatement.setTimestamp(3, Timestamp.from(Instant.now()));
-            preparedStatement.setString(4, "573658");
-            preparedStatement.setString(5, "patch");
-            preparedStatement.setString(6, jsonPatchString);
-            try {
-                preparedStatement.execute();
-                connection.commit();
-            } catch (SQLException e) {
-                if (e.getErrorCode() == -803) {
-                    throw new RuntimeException("concurrent update");
-                }
-                throw e;
-            }
         } catch (Exception e) {
-            connection.rollback();
-            throw e;
+            throw new RuntimeException(e);
         }
-    }
-
-    private static Object get(String fieldName, Object object) throws NoSuchFieldException, IllegalAccessException {
-        final var field = DueDiligence.class.getDeclaredField(fieldName);
-        field.trySetAccessible();
-        return field.get(object);
     }
 }
